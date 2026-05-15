@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+
+set -o errexit -o nounset -o pipefail
+
+SCRIPT_NAME=$(basename "$(readlink -f "${BASH_SOURCE[0]}")")
+
+toplevel() {
+    darcs show repo | grep 'Root:' | sed 's/.*Root: //'
+}
+
+rebase-dir() {
+    read -r _top < <(toplevel)
+    printf '%s/_darcs/rebase-i' "$_top"
+}
+
+patch-names-oldest-first() {
+    local n=$1
+    darcs log --xml-output --last="$n" \
+        | grep '<name>' \
+        | sed 's|.*<name>\(.*\)</name>.*|\1|; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' \
+        | tac
+}
+
+# Escape ERE metacharacters and anchor for use as a darcs --patch pattern.
+escape-patch-name() {
+    printf '^%s$' "$(printf '%s' "$1" | sed 's/[]\[\\^$.*+?|(){}]/\\&/g')"
+}
+
+# Core execution engine (shared env — not a subshell)
+execute-todo() {
+    local rebase_dir=$1
+    local todo="$rebase_dir/todo"
+
+    local todo_lines=()
+    while IFS= read -r line; do
+        todo_lines+=("$line")
+    done < "$todo"
+
+    local last_pick_name=""
+    local idx
+
+    for (( idx=0; idx<${#todo_lines[@]}; idx++ )); do
+        local line="${todo_lines[$idx]}"
+        local action name
+        action=${line%% *}
+        name=${line#* }
+
+        # Checkpoint: rewrite todo with current + remaining BEFORE executing.
+        # If a darcs command fails (errexit), the file reflects the correct resume point.
+        {
+            local j
+            for (( j=idx; j<${#todo_lines[@]}; j++ )); do
+                printf '%s\n' "${todo_lines[$j]}"
+            done
+        } > "$todo"
+
+        local escaped_name
+        escaped_name=$(escape-patch-name "$name")
+
+        case $action in
+            pick)
+                darcs rebase unsuspend --patch "$escaped_name"
+                last_pick_name=$name
+                ;;
+
+            drop)
+                : # leave suspended
+                ;;
+
+            reword)
+                darcs rebase unsuspend --patch "$escaped_name"
+                darcs amend --all --edit-long-comment
+                last_pick_name=$name
+                ;;
+
+            squash)
+                [[ -n $last_pick_name ]] || {
+                    printf '%s: squash has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
+                    exit 1
+                }
+                darcs rebase unsuspend --patch "$escaped_name"
+                darcs unrecord --last=1
+                darcs amend --all --edit-long-comment
+                ;;
+
+            fixup)
+                [[ -n $last_pick_name ]] || {
+                    printf '%s: fixup has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
+                    exit 1
+                }
+                darcs rebase unsuspend --patch "$escaped_name"
+                darcs unrecord --last=1
+                darcs amend --all
+                ;;
+
+            edit)
+                darcs rebase unsuspend --patch "$escaped_name"
+
+                local remaining=()
+                local j
+                for (( j=idx+1; j<${#todo_lines[@]}; j++ )); do
+                    remaining+=("${todo_lines[$j]}")
+                done
+
+                if [[ ${#remaining[@]} -gt 0 ]]; then
+                    printf '%s\n' "${remaining[@]}" > "$todo"
+                else
+                    rm -f "$todo"
+                fi
+
+                printf '\nStopped at: %s\n' "$name"
+                printf 'Make your changes, then run:\n'
+                printf '  %s --continue\n' "$SCRIPT_NAME"
+                printf 'To cancel the rebase:\n'
+                printf '  %s --abort\n' "$SCRIPT_NAME"
+                exit 0
+                ;;
+
+            exec)
+                bash -c "$name" || {
+                    printf '%s: exec command failed: %s\n' "$SCRIPT_NAME" "$name" >&2
+                    printf 'Fix the issue and run:\n'
+                    printf '  %s --continue\n' "$SCRIPT_NAME"
+                    exit 1
+                }
+                ;;
+
+            break)
+                local rest_lines=()
+                local j
+                for (( j=idx+1; j<${#todo_lines[@]}; j++ )); do
+                    rest_lines+=("${todo_lines[$j]}")
+                done
+
+                if [[ ${#rest_lines[@]} -gt 0 ]]; then
+                    printf '%s\n' "${rest_lines[@]}" > "$todo"
+                else
+                    rm -f "$todo"
+                fi
+
+                printf '\nStopped at break point.\n'
+                printf 'Run:\n'
+                printf '  %s --continue\n' "$SCRIPT_NAME"
+                exit 0
+                ;;
+        esac
+    done
+
+    rm -rf "$rebase_dir"
+    printf 'Rebase complete.\n'
+}
+
+cmd_rebase_i() (
+    local n=$1
+    local autosquash=$2
+
+    toplevel > /dev/null 2>&1 || {
+        printf '%s: not in a darcs repository\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    local rebase_dir
+    read -r rebase_dir < <(rebase-dir)
+    local top="${rebase_dir%/_darcs/rebase-i}"
+    local todo="$rebase_dir/todo"
+    local orig_file="$rebase_dir/original-order"
+
+    if [[ -z $n ]]; then
+        [[ -f "$top/_darcs/prefs/defaultrepo" ]] || {
+            printf '%s: no default remote configured; specify N or push to a remote first\n' \
+                "$SCRIPT_NAME" >&2
+            exit 1
+        }
+        n=0
+        while IFS= read -r sline; do
+            [[ $sline =~ ^[[:space:]]+\* ]] && n=$(( n + 1 )) || true
+        done < <(darcs send --dry-run 2>/dev/null || true)
+        [[ $n -gt 0 ]] || {
+            printf '%s: no local patches to rebase\n' "$SCRIPT_NAME" >&2
+            exit 0
+        }
+    else
+        [[ $n =~ ^[0-9]+$ && $n -gt 0 ]] || {
+            printf '%s: N must be a positive integer\n' "$SCRIPT_NAME" >&2
+            exit 64
+        }
+    fi
+
+    [[ ! -f $todo ]] || {
+        printf '%s: rebase already in progress; use --continue or --abort\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    local names=()
+    while IFS= read -r pname; do
+        names+=("$pname")
+    done < <(patch-names-oldest-first "$n")
+
+    [[ ${#names[@]} -gt 0 ]] || {
+        printf '%s: no patches found\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    # Reorder so fixup!/squash! prefixed patches follow their target
+    if $autosquash; then
+        local reordered=()
+        local i j
+        for (( i=0; i<${#names[@]}; i++ )); do
+            local pname="${names[$i]}"
+            [[ $pname == "fixup! "* || $pname == "squash! "* ]] && continue
+            reordered+=("$pname")
+            for (( j=0; j<${#names[@]}; j++ )); do
+                [[ "${names[$j]}" == "fixup! $pname" || "${names[$j]}" == "squash! $pname" ]] || continue
+                reordered+=("${names[$j]}")
+            done
+        done
+        names=("${reordered[@]}")
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+
+    local pname
+    for pname in "${names[@]}"; do
+        local action=pick
+        if $autosquash; then
+            [[ $pname == "fixup! "* ]] && action=fixup
+            [[ $pname == "squash! "* ]] && action=squash
+        fi
+        printf '%s %s\n' "$action" "$pname" >> "$tmpfile"
+    done
+
+    cat >> "$tmpfile" <<'COMMENTS'
+
+# Commands:
+#  p, pick   <name>     = use patch as-is
+#  r, reword <name>     = use patch, but edit its commit message
+#  e, edit   <name>     = use patch, but pause for manual amending
+#  s, squash <name>     = combine with previous patch, editing message
+#  f, fixup  <name>     = like squash, but discard this patch's message
+#  d, drop   <name>     = remove this patch from history
+#  x, exec   <command>  = run shell command
+#  b, break             = stop here (resume with --continue)
+#
+# Lines beginning with '#' are comments and will be ignored.
+# Empty lines are also ignored.
+# If you remove a line, that patch will be DROPPED.
+COMMENTS
+
+    {
+        printf '#\n# Patches to be rebased:\n#\n'
+        darcs log --summary --last="$n" 2>/dev/null | sed 's/^/# /' || true
+    } >> "$tmpfile"
+
+    "${GIT_SEQUENCE_EDITOR:-${EDITOR:-vi}}" "$tmpfile"
+
+    local todo_lines=()
+    while IFS= read -r line; do
+        [[ $line =~ ^[[:space:]]*# ]] && continue
+        [[ $line =~ ^[[:space:]]*$ ]] && continue
+
+        local action rest
+        action=${line%% *}
+        rest=${line#* }
+
+        case $action in
+            p)       action=pick   ;;
+            r)       action=reword ;;
+            e)       action=edit   ;;
+            s)       action=squash ;;
+            f)       action=fixup  ;;
+            d)       action=drop   ;;
+            x)       action='exec'  ;;
+            b)       action='break' ;;
+            pick|reword|edit|squash|fixup|drop|exec|break) ;;
+            *)
+                printf '%s: unknown action %q in: %s\n' "$SCRIPT_NAME" "$action" "$line" >&2
+                exit 1
+                ;;
+        esac
+        todo_lines+=("$action $rest")
+    done < "$tmpfile"
+
+    [[ ${#todo_lines[@]} -gt 0 ]] || {
+        printf '%s: empty todo list; aborting\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    local first_action=${todo_lines[0]%% *}
+    [[ $first_action != squash && $first_action != fixup ]] || {
+        printf '%s: first action cannot be squash or fixup\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    # Suspend newest-first to avoid dependency cascades
+    local i
+    for (( i=${#names[@]}-1; i>=0; i-- )); do
+        darcs rebase suspend --patch "$(escape-patch-name "${names[$i]}")"
+    done
+
+    local suspended_count=0
+    suspended_count=$(darcs rebase log 2>/dev/null | grep -c '^\s*\*' || true)
+    if [[ $suspended_count -gt $n ]]; then
+        printf '%s: warning: darcs suspended %d extra patch(es) due to dependencies\n' \
+            "$SCRIPT_NAME" $(( suspended_count - n )) >&2
+        printf '%s: run "darcs rebase log" to see all suspended patches\n' "$SCRIPT_NAME" >&2
+    fi
+
+    mkdir -p "$rebase_dir"
+    printf '%s\n' "${names[@]}" > "$orig_file"  # save original order for --abort
+    printf '%s\n' "${todo_lines[@]}" > "$todo"
+
+    execute-todo "$rebase_dir"
+)
+
+cmd_continue() (
+    local rebase_dir
+    read -r rebase_dir < <(rebase-dir)
+    local todo="$rebase_dir/todo"
+
+    [[ -f $todo ]] || {
+        printf '%s: no rebase in progress\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    execute-todo "$rebase_dir"
+)
+
+cmd_abort() (
+    local rebase_dir
+    read -r rebase_dir < <(rebase-dir)
+    local todo="$rebase_dir/todo"
+    local orig_file="$rebase_dir/original-order"
+
+    [[ -f $todo ]] || {
+        printf '%s: no rebase in progress\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    [[ -f $orig_file ]] || {
+        printf '%s: original-order file missing; cannot abort cleanly\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    local orig_names=()
+    while IFS= read -r oname; do
+        orig_names+=("$oname")
+    done < "$orig_file"
+
+    local suspended_names=()
+    while IFS= read -r sline; do
+        [[ $sline =~ ^[[:space:]]+\*[[:space:]] ]] || continue
+        suspended_names+=("${sline#*\* }")
+    done < <(darcs rebase log 2>/dev/null || true)
+
+    # Identify patches already back in repo (not currently suspended) to re-suspend before restore
+    local needs_resuspend=()
+    local oname sname found
+    for oname in "${orig_names[@]}"; do
+        found=false
+        for sname in "${suspended_names[@]}"; do
+            [[ $sname == "$oname" ]] && { found=true; break; }
+        done
+        $found || needs_resuspend+=("$oname")
+    done
+
+    if [[ ${#needs_resuspend[@]} -gt 0 ]]; then
+        printf '%s: warning: some patches were already applied; abort may be incomplete\n' \
+            "$SCRIPT_NAME" >&2
+        printf '%s: if squash/fixup was executed, merged patches cannot be split\n' \
+            "$SCRIPT_NAME" >&2
+    fi
+
+    local i
+    for (( i=${#needs_resuspend[@]}-1; i>=0; i-- )); do
+        darcs rebase suspend --patch "$(escape-patch-name "${needs_resuspend[$i]}")"
+    done
+
+    for oname in "${orig_names[@]}"; do
+        darcs rebase unsuspend --patch "$(escape-patch-name "$oname")" 2>/dev/null || {
+            printf '%s: warning: could not unsuspend %q\n' "$SCRIPT_NAME" "$oname" >&2
+        }
+    done
+
+    rm -rf "$rebase_dir"
+    printf 'Rebase aborted. Repository restored to original state.\n'
+)
+
+cmd_status() (
+    local rebase_dir
+    read -r rebase_dir < <(rebase-dir)
+    local todo="$rebase_dir/todo"
+
+    if [[ ! -f $todo ]]; then
+        printf 'No rebase in progress.\n'
+        exit 0
+    fi
+
+    printf 'Remaining actions:\n'
+    cat "$todo"
+    printf '\nCurrently suspended patches:\n'
+    darcs rebase log 2>/dev/null || printf '  (none)\n'
+)
+
+help() {
+    cat - <<EOF
+$SCRIPT_NAME - git rebase --interactive mimic for darcs
+
+Usage:
+  $SCRIPT_NAME [--autosquash] [N]  interactively rebase; N defaults to local (unpushed) patches
+  $SCRIPT_NAME --continue          resume after an 'edit', 'exec', or 'break' pause
+  $SCRIPT_NAME --abort           cancel rebase and restore original state
+  $SCRIPT_NAME --status          show current rebase progress
+  $SCRIPT_NAME --help            show this help
+
+Options:
+  --autosquash  move fixup!/squash! prefixed patches after their target automatically
+
+Actions (in the editor):
+  p, pick   <name>     use patch as-is
+  r, reword <name>     use patch, but edit its commit message
+  e, edit   <name>     use patch, but pause for manual amending
+  s, squash <name>     combine with previous patch, editing message
+  f, fixup  <name>     like squash, but discard this patch's message
+  d, drop   <name>     remove this patch from history
+  x, exec   <command>  run shell command
+  b, break             stop here (resume with --continue)
+
+EOF
+}
+
+main() (
+    local autosquash=false
+    local parsed
+    read -r parsed < <(
+        getopt --options=h \
+               --longoptions=help,continue,abort,status,autosquash \
+               --name "$SCRIPT_NAME" \
+               -- "$@"
+    )
+    eval set -- "$parsed"
+
+    while true; do
+        case "$1" in
+            -h|--help)
+                help
+                exit 0
+                ;;
+            --continue)
+                shift
+                cmd_continue
+                exit 0
+                ;;
+            --abort)
+                shift
+                cmd_abort
+                exit 0
+                ;;
+            --status)
+                shift
+                cmd_status
+                exit 0
+                ;;
+            --autosquash)
+                autosquash=true
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -gt 1 ]]; then
+        printf '%s: too many arguments\n' "$SCRIPT_NAME" >&2
+        exit 64
+    fi
+
+    cmd_rebase_i "${1:-}" "$autosquash"
+)
+
+main "$@"
