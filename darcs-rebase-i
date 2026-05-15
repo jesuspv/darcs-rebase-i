@@ -59,7 +59,7 @@ execute-todo() {
 
         case $action in
             pick)
-                darcs rebase unsuspend --patch "$escaped_name"
+                darcs rebase unsuspend --all --patch "$escaped_name"
                 last_pick_name=$name
                 ;;
 
@@ -68,7 +68,7 @@ execute-todo() {
                 ;;
 
             reword)
-                darcs rebase unsuspend --patch "$escaped_name"
+                darcs rebase unsuspend --all --patch "$escaped_name"
                 darcs amend --all --edit-long-comment
                 last_pick_name=$name
                 ;;
@@ -78,8 +78,8 @@ execute-todo() {
                     printf '%s: squash has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
                     exit 1
                 }
-                darcs rebase unsuspend --patch "$escaped_name"
-                darcs unrecord --last=1
+                darcs rebase unsuspend --all --patch "$escaped_name"
+                darcs unrecord --all --last=1
                 darcs amend --all --edit-long-comment
                 ;;
 
@@ -88,13 +88,13 @@ execute-todo() {
                     printf '%s: fixup has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
                     exit 1
                 }
-                darcs rebase unsuspend --patch "$escaped_name"
-                darcs unrecord --last=1
+                darcs rebase unsuspend --all --patch "$escaped_name"
+                darcs unrecord --all --last=1
                 darcs amend --all
                 ;;
 
             edit)
-                darcs rebase unsuspend --patch "$escaped_name"
+                darcs rebase unsuspend --all --patch "$escaped_name"
 
                 local remaining=()
                 local j
@@ -296,7 +296,7 @@ COMMENTS
     # Suspend newest-first to avoid dependency cascades
     local i
     for (( i=${#names[@]}-1; i>=0; i-- )); do
-        darcs rebase suspend --patch "$(escape-patch-name "${names[$i]}")"
+        darcs rebase suspend --all --patch "$(escape-patch-name "${names[$i]}")"
     done
 
     local suspended_count=0
@@ -374,11 +374,11 @@ cmd_abort() (
 
     local i
     for (( i=${#needs_resuspend[@]}-1; i>=0; i-- )); do
-        darcs rebase suspend --patch "$(escape-patch-name "${needs_resuspend[$i]}")"
+        darcs rebase suspend --all --patch "$(escape-patch-name "${needs_resuspend[$i]}")"
     done
 
     for oname in "${orig_names[@]}"; do
-        darcs rebase unsuspend --patch "$(escape-patch-name "$oname")" 2>/dev/null || {
+        darcs rebase unsuspend --all --patch "$(escape-patch-name "$oname")" 2>/dev/null || {
             printf '%s: warning: could not unsuspend %q\n' "$SCRIPT_NAME" "$oname" >&2
         }
     done
