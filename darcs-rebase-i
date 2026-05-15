@@ -10,7 +10,7 @@ toplevel() {
 
 rebase-dir() {
     read -r _top < <(toplevel)
-    printf '%s/_darcs/rebase-i' "$_top"
+    printf '%s/_darcs/rebase-i\n' "$_top"
 }
 
 patch-names-oldest-first() {
