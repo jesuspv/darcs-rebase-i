@@ -21,9 +21,10 @@ patch-names-oldest-first() {
         | tac
 }
 
-# Run darcs, feeding 'y' to any author-mismatch prompts that --all doesn't suppress.
+# Run darcs, feeding 'y' to any author-mismatch prompts and suppressing their text.
 darcs-yes() {
-    yes y 2>/dev/null | darcs "$@" || [[ ${PIPESTATUS[1]} -eq 0 ]]
+    { yes y 2>/dev/null | darcs "$@" 2>&1 || [[ ${PIPESTATUS[1]} -eq 0 ]]; } \
+        | sed "s/You're not [^!]*! [A-Za-z]* anyway?  *\[yn[a]*\] *//g"
 }
 
 # Escape ERE metacharacters and anchor for use as a darcs --patch pattern.
@@ -383,7 +384,7 @@ cmd_abort() (
     done
 
     for oname in "${orig_names[@]}"; do
-        darcs-yes rebase unsuspend --all --quiet --patch "$(escape-patch-name "$oname")" 2>/dev/null || {
+        darcs-yes rebase unsuspend --all --quiet --patch "$(escape-patch-name "$oname")" >/dev/null 2>&1 || {
             printf '%s: warning: could not unsuspend %q\n' "$SCRIPT_NAME" "$oname" >&2
         }
     done
