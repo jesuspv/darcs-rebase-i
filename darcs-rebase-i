@@ -75,7 +75,7 @@ execute-todo() {
 
             reword)
                 darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
-                darcs-yes amend --all --edit-long-comment
+                darcs amend --all --edit-long-comment
                 last_pick_name=$name
                 ;;
 
@@ -86,7 +86,7 @@ execute-todo() {
                 }
                 darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
                 darcs-yes unrecord --all --quiet --last=1
-                darcs-yes amend --all --edit-long-comment
+                darcs amend --all --edit-long-comment
                 ;;
 
             fixup)
