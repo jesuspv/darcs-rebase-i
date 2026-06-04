@@ -333,6 +333,33 @@ cmd_continue() (
     execute-todo "$rebase_dir"
 )
 
+cmd_skip() (
+    local rebase_dir
+    read -r rebase_dir < <(rebase-dir)
+    local todo="$rebase_dir/todo"
+
+    [[ -f $todo ]] || {
+        printf '%s: no rebase in progress\n' "$SCRIPT_NAME" >&2
+        exit 1
+    }
+
+    local lines=()
+    while IFS= read -r line; do
+        lines+=("$line")
+    done < "$todo"
+
+    printf 'Skipping: %s\n' "${lines[0]#* }"
+
+    if [[ ${#lines[@]} -le 1 ]]; then
+        rm -rf "$rebase_dir"
+        printf 'Rebase complete.\n'
+        return
+    fi
+
+    printf '%s\n' "${lines[@]:1}" > "$todo"
+    execute-todo "$rebase_dir"
+)
+
 cmd_abort() (
     local rebase_dir
     read -r rebase_dir < <(rebase-dir)
@@ -417,6 +444,7 @@ Usage:
   $SCRIPT_NAME [--autosquash] [N]  interactively rebase; N defaults to local (unpushed) patches
   $SCRIPT_NAME --continue          resume after an 'edit', 'exec', or 'break' pause
   $SCRIPT_NAME --abort           cancel rebase and restore original state
+  $SCRIPT_NAME --skip            skip current failing patch and continue
   $SCRIPT_NAME --status          show current rebase progress
   $SCRIPT_NAME --help            show this help
 
@@ -441,7 +469,7 @@ main() (
     local parsed
     read -r parsed < <(
         getopt --options=h \
-               --longoptions=help,continue,abort,status,autosquash \
+               --longoptions=help,continue,abort,skip,status,autosquash \
                --name "$SCRIPT_NAME" \
                -- "$@"
     )
@@ -461,6 +489,11 @@ main() (
             --abort)
                 shift
                 cmd_abort
+                exit 0
+                ;;
+            --skip)
+                shift
+                cmd_skip
                 exit 0
                 ;;
             --status)
