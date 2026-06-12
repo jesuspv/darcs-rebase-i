@@ -320,6 +320,24 @@ COMMENTS
         exit 1
     }
 
+    # If the todo is identical to the original (all picks, same order), nothing to do.
+    local unchanged=true
+    if [[ ${#todo_lines[@]} -eq ${#names[@]} ]]; then
+        local i
+        for (( i=0; i<${#todo_lines[@]}; i++ )); do
+            if [[ "${todo_lines[$i]}" != "pick ${names[$i]}" ]]; then
+                unchanged=false
+                break
+            fi
+        done
+    else
+        unchanged=false
+    fi
+    if $unchanged; then
+        printf '%s: nothing to do\n' "$SCRIPT_NAME"
+        exit 0
+    fi
+
     # Suspend newest-first to avoid dependency cascades
     local i
     for (( i=${#names[@]}-1; i>=0; i-- )); do
