@@ -70,7 +70,8 @@ execute-todo() {
                 ;;
 
             drop)
-                : # leave suspended
+                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
+                darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --patches "$escaped_name"
                 ;;
 
             reword)
@@ -151,6 +152,26 @@ execute-todo() {
                 ;;
         esac
     done
+
+    # Obliterate patches removed by deleting their line in the editor (still suspended)
+    local _suspended_finals=()
+    while IFS= read -r _sline; do
+        [[ $_sline =~ ^[[:space:]]+\*[[:space:]] ]] || continue
+        _suspended_finals+=("${_sline#*\* }")
+    done < <(darcs rebase log 2>/dev/null || true)
+
+    while IFS= read -r _oname; do
+        local _found=false _sn
+        for _sn in "${_suspended_finals[@]}"; do
+            [[ "$_sn" == "$_oname" ]] && { _found=true; break; }
+        done
+        if $_found; then
+            local _esc
+            _esc=$(escape-patch-name "$_oname")
+            darcs-yes rebase unsuspend --all --quiet --patch "$_esc"
+            darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --patches "$_esc"
+        fi
+    done < "$rebase_dir/original-order"
 
     rm -rf "$rebase_dir"
     printf 'Rebase complete.\n'
