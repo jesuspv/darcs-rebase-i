@@ -87,7 +87,21 @@ execute-todo() {
                 }
                 darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
                 darcs-yes unrecord --all --quiet --last=1
-                darcs amend --all --edit-long-comment
+                local squash_msg_file squash_editor_script
+                squash_msg_file=$(mktemp)
+                squash_editor_script=$(mktemp)
+                printf '%s\n' "$name" > "$squash_msg_file"
+                cat > "$squash_editor_script" << 'EOF'
+#!/usr/bin/env bash
+{ printf '\n'; cat "$SQUASH_MSG_FILE"; } >> "$1"
+exec "${DARCS_REAL_EDITOR:-${VISUAL:-${EDITOR:-vi}}}" "$1"
+EOF
+                chmod +x "$squash_editor_script"
+                SQUASH_MSG_FILE="$squash_msg_file" \
+                    DARCS_REAL_EDITOR="${DARCS_EDITOR:-}" \
+                    DARCS_EDITOR="$squash_editor_script" \
+                    darcs amend --all --edit-long-comment
+                rm -f "$squash_msg_file" "$squash_editor_script"
                 ;;
 
             fixup)
