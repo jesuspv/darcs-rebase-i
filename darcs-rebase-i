@@ -323,10 +323,12 @@ COMMENTS
         todo_lines+=("$action $rest")
     done < "$tmpfile"
 
-    [[ ${#todo_lines[@]} -gt 0 ]] || {
-        printf '%s: empty todo list; aborting\n' "$SCRIPT_NAME" >&2
-        exit 1
-    }
+    if [[ ${#todo_lines[@]} -eq 0 ]]; then
+        local name
+        for name in "${names[@]}"; do
+            todo_lines+=("drop $name")
+        done
+    fi
 
     local first_action=${todo_lines[0]%% *}
     [[ $first_action != squash && $first_action != fixup ]] || {
