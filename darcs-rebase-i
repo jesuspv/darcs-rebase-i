@@ -196,7 +196,15 @@ execute-todo() {
                 printf '%s\n' "$name" > "$squash_msg_file"
                 cat > "$squash_editor_script" << 'EOF'
 #!/usr/bin/env bash
-{ printf '\n'; cat "$SQUASH_MSG_FILE"; } >> "$1"
+tmpfile=$(mktemp)
+awk -v msg_file="$SQUASH_MSG_FILE" '
+    !inserted && /^#/ {
+        while ((getline line < msg_file) > 0) print line
+        print ""
+        inserted = 1
+    }
+    { print }
+' "$1" > "$tmpfile" && mv "$tmpfile" "$1"
 exec "${DARCS_REAL_EDITOR:-${VISUAL:-${EDITOR:-vi}}}" "$1"
 EOF
                 chmod +x "$squash_editor_script"
