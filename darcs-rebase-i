@@ -13,23 +13,32 @@ rebase-dir() {
     printf '%s/_darcs/rebase-i\n' "$_top"
 }
 
-patch-names-oldest-first() {
+# Returns "hash\tname" pairs, oldest first.
+patch-info-oldest-first() {
     local n=$1
-    darcs log --xml-output --last="$n" \
-        | grep '<name>' \
-        | sed 's|.*<name>\(.*\)</name>.*|\1|; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' \
-        | tac
+    darcs log --xml-output --last="$n" | {
+        local current_hash=''
+        while IFS= read -r line; do
+            if [[ $line =~ \<patch[[:space:]] ]]; then
+                current_hash="${line#*hash=\'}"
+                current_hash="${current_hash%%\'*}"
+            elif [[ $line =~ \<name\> ]]; then
+                local name="${line#*<name>}"
+                name="${name%%</name>*}"
+                name="${name//&amp;/&}"
+                name="${name//&lt;/<}"
+                name="${name//&gt;/>}"
+                name="${name//&quot;/\"}"
+                printf '%s\t%s\n' "$current_hash" "$name"
+            fi
+        done
+    } | tac
 }
 
 # Run darcs, feeding 'y' to any author-mismatch prompts and suppressing their text.
 darcs-yes() {
     { yes y 2>/dev/null | darcs "$@" 2>&1 || [[ ${PIPESTATUS[1]} -eq 0 ]]; } \
         | sed "s/You're not [^!]*! [A-Za-z]* anyway?  *\[yn[a]*\] *//g"
-}
-
-# Escape ERE metacharacters and anchor for use as a darcs --patch pattern.
-escape-patch-name() {
-    printf '^%s$' "$(printf '%s' "$1" | sed 's/[]\[\\^$.*+?|(){}]/\\&/g')"
 }
 
 # Core execution engine (shared env — not a subshell)
@@ -45,11 +54,26 @@ execute-todo() {
     local last_pick_name=""
     local idx
 
+    # Track which hashes were explicitly processed (for cleanup).
+    local processed_hashes=()
+
     for (( idx=0; idx<${#todo_lines[@]}; idx++ )); do
         local line="${todo_lines[$idx]}"
-        local action name
+        local action rest hash name
         action=${line%% *}
-        name=${line#* }
+        rest=${line#* }
+
+        case $action in
+            exec|break)
+                hash=''
+                name=$rest
+                ;;
+            *)
+                hash=${rest%% *}
+                name=${rest#* }
+                processed_hashes+=("$hash")
+                ;;
+        esac
 
         # Checkpoint: rewrite todo with current + remaining BEFORE executing.
         # If a darcs command fails (errexit), the file reflects the correct resume point.
@@ -60,22 +84,19 @@ execute-todo() {
             done
         } > "$todo"
 
-        local escaped_name
-        escaped_name=$(escape-patch-name "$name")
-
         case $action in
             pick)
-                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
+                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 last_pick_name=$name
                 ;;
 
             drop)
-                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
-                darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --patches "$escaped_name"
+                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
+                darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --hash "$hash"
                 ;;
 
             reword)
-                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
+                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 darcs amend --all --edit-long-comment
                 last_pick_name=$name
                 ;;
@@ -85,7 +106,7 @@ execute-todo() {
                     printf '%s: squash has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
                     exit 1
                 }
-                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
+                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 darcs-yes unrecord --all --quiet --last=1
                 local squash_msg_file squash_editor_script
                 squash_msg_file=$(mktemp)
@@ -109,13 +130,13 @@ EOF
                     printf '%s: fixup has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
                     exit 1
                 }
-                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
+                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 darcs-yes unrecord --all --quiet --last=1
                 darcs-yes amend --all
                 ;;
 
             edit)
-                darcs-yes rebase unsuspend --all --quiet --patch "$escaped_name"
+                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
 
                 local remaining=()
                 local j
@@ -167,25 +188,24 @@ EOF
         esac
     done
 
-    # Obliterate patches removed by deleting their line in the editor (still suspended)
-    local _suspended_finals=()
-    while IFS= read -r _sline; do
-        [[ $_sline =~ ^[[:space:]]+\*[[:space:]] ]] || continue
-        _suspended_finals+=("${_sline#*\* }")
-    done < <(darcs rebase log 2>/dev/null || true)
-
-    while IFS= read -r _oname; do
-        local _found=false _sn
-        for _sn in "${_suspended_finals[@]}"; do
-            [[ "$_sn" == "$_oname" ]] && { _found=true; break; }
-        done
-        if $_found; then
-            local _esc
-            _esc=$(escape-patch-name "$_oname")
-            darcs-yes rebase unsuspend --all --quiet --patch "$_esc"
-            darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --patches "$_esc"
-        fi
+    # Obliterate patches implicitly dropped by deleting their line in the editor.
+    # Read original hashes from file; any not processed by the todo loop are still suspended.
+    local orig_hashes=()
+    while IFS=$'\t' read -r ohash _oname; do
+        orig_hashes+=("$ohash")
     done < "$rebase_dir/original-order"
+
+    local ohash
+    for ohash in "${orig_hashes[@]}"; do
+        local found=false ph
+        for ph in "${processed_hashes[@]}"; do
+            [[ "$ph" == "$ohash" ]] && { found=true; break; }
+        done
+        if ! $found; then
+            darcs-yes rebase unsuspend --all --quiet --hash "$ohash"
+            darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --hash "$ohash"
+        fi
+    done
 
     rm -rf "$rebase_dir"
     printf 'Rebase complete.\n'
@@ -232,10 +252,12 @@ cmd_rebase_i() (
         exit 1
     }
 
+    local hashes=()
     local names=()
-    while IFS= read -r pname; do
+    while IFS=$'\t' read -r phash pname; do
+        hashes+=("$phash")
         names+=("$pname")
-    done < <(patch-names-oldest-first "$n")
+    done < <(patch-info-oldest-first "$n")
 
     [[ ${#names[@]} -gt 0 ]] || {
         printf '%s: no patches found\n' "$SCRIPT_NAME" >&2
@@ -244,49 +266,56 @@ cmd_rebase_i() (
 
     # Reorder so fixup!/squash! prefixed patches follow their target
     if $autosquash; then
-        local reordered=()
+        local reordered_hashes=()
+        local reordered_names=()
         local i j
         for (( i=0; i<${#names[@]}; i++ )); do
             local pname="${names[$i]}"
             [[ $pname == "fixup! "* || $pname == "squash! "* ]] && continue
-            reordered+=("$pname")
+            reordered_names+=("$pname")
+            reordered_hashes+=("${hashes[$i]}")
             for (( j=0; j<${#names[@]}; j++ )); do
                 [[ "${names[$j]}" == "fixup! $pname" || "${names[$j]}" == "squash! $pname" ]] || continue
-                reordered+=("${names[$j]}")
+                reordered_names+=("${names[$j]}")
+                reordered_hashes+=("${hashes[$j]}")
             done
         done
-        names=("${reordered[@]}")
+        names=("${reordered_names[@]}")
+        hashes=("${reordered_hashes[@]}")
     fi
 
     local tmpfile
     tmpfile=$(mktemp)
     trap 'rm -f "$tmpfile"' EXIT
 
-    local pname
-    for pname in "${names[@]}"; do
+    local i
+    for (( i=0; i<${#names[@]}; i++ )); do
+        local pname="${names[$i]}"
+        local phash="${hashes[$i]}"
         local action=pick
         if $autosquash; then
             [[ $pname == "fixup! "* ]] && action=fixup
             [[ $pname == "squash! "* ]] && action=squash
         fi
-        printf '%s %s\n' "$action" "$pname" >> "$tmpfile"
+        printf '%s %s %s\n' "$action" "$phash" "$pname" >> "$tmpfile"
     done
 
     cat >> "$tmpfile" <<'COMMENTS'
 
 # Commands:
-#  p, pick   <name>     = use patch as-is
-#  r, reword <name>     = use patch, but edit its commit message
-#  e, edit   <name>     = use patch, but pause for manual amending
-#  s, squash <name>     = combine with previous patch, editing message
-#  f, fixup  <name>     = like squash, but discard this patch's message
-#  d, drop   <name>     = remove this patch from history
-#  x, exec   <command>  = run shell command
-#  b, break             = stop here (resume with --continue)
+#  p, pick   <hash> <name>   = use patch as-is
+#  r, reword <hash> <name>   = use patch, but edit its commit message
+#  e, edit   <hash> <name>   = use patch, but pause for manual amending
+#  s, squash <hash> <name>   = combine with previous patch, editing message
+#  f, fixup  <hash> <name>   = like squash, but discard this patch's message
+#  d, drop   <hash> <name>   = remove this patch from history
+#  x, exec   <command>       = run shell command
+#  b, break                  = stop here (resume with --continue)
 #
 # Lines beginning with '#' are comments and will be ignored.
 # Empty lines are also ignored.
 # If you remove a line, that patch will be DROPPED.
+# Do not modify the hash field — it uniquely identifies each patch.
 COMMENTS
 
     {
@@ -296,6 +325,8 @@ COMMENTS
 
     "${GIT_SEQUENCE_EDITOR:-${EDITOR:-vi}}" "$tmpfile"
 
+    # Build a hash→index map for looking up hashes when parsing editor output.
+    # (The user edits action and name but the hash must stay intact.)
     local todo_lines=()
     while IFS= read -r line; do
         [[ $line =~ ^[[:space:]]*# ]] && continue
@@ -324,9 +355,9 @@ COMMENTS
     done < "$tmpfile"
 
     if [[ ${#todo_lines[@]} -eq 0 ]]; then
-        local name
-        for name in "${names[@]}"; do
-            todo_lines+=("drop $name")
+        local i
+        for (( i=0; i<${#names[@]}; i++ )); do
+            todo_lines+=("drop ${hashes[$i]} ${names[$i]}")
         done
     fi
 
@@ -341,7 +372,7 @@ COMMENTS
     if [[ ${#todo_lines[@]} -eq ${#names[@]} ]]; then
         local i
         for (( i=0; i<${#todo_lines[@]}; i++ )); do
-            if [[ "${todo_lines[$i]}" != "pick ${names[$i]}" ]]; then
+            if [[ "${todo_lines[$i]}" != "pick ${hashes[$i]} ${names[$i]}" ]]; then
                 unchanged=false
                 break
             fi
@@ -356,8 +387,8 @@ COMMENTS
 
     # Suspend newest-first to avoid dependency cascades
     local i
-    for (( i=${#names[@]}-1; i>=0; i-- )); do
-        darcs-yes rebase suspend --all --quiet --patch "$(escape-patch-name "${names[$i]}")"
+    for (( i=${#hashes[@]}-1; i>=0; i-- )); do
+        darcs-yes rebase suspend --all --quiet --hash "${hashes[$i]}"
     done
 
     local suspended_count=0
@@ -369,7 +400,11 @@ COMMENTS
     fi
 
     mkdir -p "$rebase_dir"
-    printf '%s\n' "${names[@]}" > "$orig_file"  # save original order for --abort
+    # Store "hash\tname" in original-order for use by --abort and cleanup.
+    local i
+    for (( i=0; i<${#hashes[@]}; i++ )); do
+        printf '%s\t%s\n' "${hashes[$i]}" "${names[$i]}"
+    done > "$orig_file"
     printf '%s\n' "${todo_lines[@]}" > "$todo"
 
     execute-todo "$rebase_dir"
@@ -403,7 +438,18 @@ cmd_skip() (
         lines+=("$line")
     done < "$todo"
 
-    printf 'Skipping: %s\n' "${lines[0]#* }"
+    # Name is third field (after action and hash) for patch actions.
+    local first="${lines[0]}"
+    local first_action="${first%% *}"
+    local first_rest="${first#* }"
+    case $first_action in
+        exec|break)
+            printf 'Skipping: %s\n' "$first_rest"
+            ;;
+        *)
+            printf 'Skipping: %s\n' "${first_rest#* }"
+            ;;
+    esac
 
     if [[ ${#lines[@]} -le 1 ]]; then
         rm -rf "$rebase_dir"
@@ -431,8 +477,10 @@ cmd_abort() (
         exit 1
     }
 
+    local orig_hashes=()
     local orig_names=()
-    while IFS= read -r oname; do
+    while IFS=$'\t' read -r ohash oname; do
+        orig_hashes+=("$ohash")
         orig_names+=("$oname")
     done < "$orig_file"
 
@@ -442,18 +490,20 @@ cmd_abort() (
         suspended_names+=("${sline#*\* }")
     done < <(darcs rebase log 2>/dev/null || true)
 
-    # Identify patches already back in repo (not currently suspended) to re-suspend before restore
-    local needs_resuspend=()
-    local oname sname found
-    for oname in "${orig_names[@]}"; do
-        found=false
+    # Identify patches already back in repo (not currently suspended) to re-suspend before restore.
+    # We check by name; for duplicate names this may be imprecise but abort is best-effort.
+    local needs_resuspend_hashes=()
+    local i
+    for (( i=0; i<${#orig_names[@]}; i++ )); do
+        local oname="${orig_names[$i]}"
+        local found=false sname
         for sname in "${suspended_names[@]}"; do
             [[ $sname == "$oname" ]] && { found=true; break; }
         done
-        $found || needs_resuspend+=("$oname")
+        $found || needs_resuspend_hashes+=("${orig_hashes[$i]}")
     done
 
-    if [[ ${#needs_resuspend[@]} -gt 0 ]]; then
+    if [[ ${#needs_resuspend_hashes[@]} -gt 0 ]]; then
         printf '%s: warning: some patches were already applied; abort may be incomplete\n' \
             "$SCRIPT_NAME" >&2
         printf '%s: if squash/fixup was executed, merged patches cannot be split\n' \
@@ -461,13 +511,14 @@ cmd_abort() (
     fi
 
     local i
-    for (( i=${#needs_resuspend[@]}-1; i>=0; i-- )); do
-        darcs-yes rebase suspend --all --quiet --patch "$(escape-patch-name "${needs_resuspend[$i]}")"
+    for (( i=${#needs_resuspend_hashes[@]}-1; i>=0; i-- )); do
+        darcs-yes rebase suspend --all --quiet --hash "${needs_resuspend_hashes[$i]}"
     done
 
-    for oname in "${orig_names[@]}"; do
-        darcs-yes rebase unsuspend --all --quiet --patch "$(escape-patch-name "$oname")" >/dev/null 2>&1 || {
-            printf '%s: warning: could not unsuspend %q\n' "$SCRIPT_NAME" "$oname" >&2
+    local ohash
+    for ohash in "${orig_hashes[@]}"; do
+        darcs-yes rebase unsuspend --all --quiet --hash "$ohash" >/dev/null 2>&1 || {
+            printf '%s: warning: could not unsuspend hash %s\n' "$SCRIPT_NAME" "$ohash" >&2
         }
     done
 
@@ -507,14 +558,14 @@ Options:
   --autosquash  move fixup!/squash! prefixed patches after their target automatically
 
 Actions (in the editor):
-  p, pick   <name>     use patch as-is
-  r, reword <name>     use patch, but edit its commit message
-  e, edit   <name>     use patch, but pause for manual amending
-  s, squash <name>     combine with previous patch, editing message
-  f, fixup  <name>     like squash, but discard this patch's message
-  d, drop   <name>     remove this patch from history
-  x, exec   <command>  run shell command
-  b, break             stop here (resume with --continue)
+  p, pick   <hash> <name>   use patch as-is
+  r, reword <hash> <name>   use patch, but edit its commit message
+  e, edit   <hash> <name>   use patch, but pause for manual amending
+  s, squash <hash> <name>   combine with previous patch, editing message
+  f, fixup  <hash> <name>   like squash, but discard this patch's message
+  d, drop   <hash> <name>   remove this patch from history
+  x, exec   <command>       run shell command
+  b, break                  stop here (resume with --continue)
 
 EOF
 }
