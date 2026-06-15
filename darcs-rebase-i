@@ -108,6 +108,7 @@ execute-todo() {
             *)
                 hash=${rest%% *}
                 name=${rest#* }
+                name="${name#\# }"
                 processed_hashes+=("$hash")
                 ;;
         esac
@@ -416,7 +417,7 @@ cmd_rebase_i() (
             [[ $pname == "fixup! "* ]] && action=fixup
             [[ $pname == "squash! "* ]] && action=squash
         fi
-        printf '%s %s %s\n' "$action" "$phash" "$pname" >> "$tmpfile"
+        printf '%s %s # %s\n' "$action" "$phash" "$pname" >> "$tmpfile"
     done
 
     cat >> "$tmpfile" <<'COMMENTS'
@@ -491,7 +492,7 @@ COMMENTS
     if [[ ${#todo_lines[@]} -eq ${#names[@]} ]]; then
         local i
         for (( i=0; i<${#todo_lines[@]}; i++ )); do
-            if [[ "${todo_lines[$i]}" != "pick ${hashes[$i]} ${names[$i]}" ]]; then
+            if [[ "${todo_lines[$i]}" != "pick ${hashes[$i]} # ${names[$i]}" ]]; then
                 unchanged=false
                 break
             fi
@@ -566,7 +567,8 @@ cmd_skip() (
             printf 'Skipping: %s\n' "$first_rest"
             ;;
         *)
-            printf 'Skipping: %s\n' "${first_rest#* }"
+            local skip_name="${first_rest#* }"
+            printf 'Skipping: %s\n' "${skip_name#\# }"
             ;;
     esac
 
