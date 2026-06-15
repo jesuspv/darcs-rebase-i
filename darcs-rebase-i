@@ -13,26 +13,63 @@ rebase-dir() {
     printf '%s/_darcs/rebase-i\n' "$_top"
 }
 
-# Returns "hash\tname" pairs, oldest first.
+# Returns "hash\tname" pairs, oldest first, with the shortest prefix that
+# uniquely distinguishes all N hashes among themselves (minimum 7, like git).
 patch-info-oldest-first() {
     local n=$1
-    darcs log --xml-output --last="$n" | {
-        local current_hash=''
-        while IFS= read -r line; do
-            if [[ $line =~ \<patch[[:space:]] ]]; then
-                current_hash="${line#*hash=\'}"
-                current_hash="${current_hash%%\'*}"
-            elif [[ $line =~ \<name\> ]]; then
-                local name="${line#*<name>}"
-                name="${name%%</name>*}"
-                name="${name//&amp;/&}"
-                name="${name//&lt;/<}"
-                name="${name//&gt;/>}"
-                name="${name//&quot;/\"}"
-                printf '%s\t%s\n' "$current_hash" "$name"
-            fi
+
+    local full_hashes=() names=()
+    local current_hash=''
+    while IFS= read -r line; do
+        if [[ $line =~ \<patch[[:space:]] ]]; then
+            current_hash="${line#*hash=\'}"
+            current_hash="${current_hash%%\'*}"
+        elif [[ $line =~ \<name\> ]]; then
+            local name="${line#*<name>}"
+            name="${name%%</name>*}"
+            name="${name//&amp;/&}"
+            name="${name//&lt;/<}"
+            name="${name//&gt;/>}"
+            name="${name//&quot;/\"}"
+            full_hashes+=("$current_hash")
+            names+=("$name")
+        fi
+    done < <(darcs log --xml-output --last="$n")
+
+    # Reverse to oldest-first.
+    local lo=0 hi=$(( ${#full_hashes[@]} - 1 ))
+    while (( lo < hi )); do
+        local tmp="${full_hashes[$lo]}"; full_hashes[$lo]="${full_hashes[$hi]}"; full_hashes[$hi]="$tmp"
+        tmp="${names[$lo]}"; names[$lo]="${names[$hi]}"; names[$hi]="$tmp"
+        (( lo++, hi-- ))
+    done
+
+    # Find minimum prefix length where all hashes are distinct (min 7).
+    local len=7
+    while (( len < ${#full_hashes[0]} )); do
+        local unique=true
+        local i j
+        for (( i=0; i<${#full_hashes[@]}-1; i++ )); do
+            for (( j=i+1; j<${#full_hashes[@]}; j++ )); do
+                if [[ "${full_hashes[$i]:0:$len}" == "${full_hashes[$j]:0:$len}" ]]; then
+                    unique=false
+                    break 2
+                fi
+            done
         done
-    } | tac
+        $unique && break
+        (( len++ ))
+    done
+
+    local i
+    for (( i=0; i<${#full_hashes[@]}; i++ )); do
+        printf '%s\t%s\n' "${full_hashes[$i]:0:$len}" "${names[$i]}"
+    done
+}
+
+# Escape ERE metacharacters and anchor for use as a darcs --patches pattern.
+escape-patch-name() {
+    printf '^%s$' "$(printf '%s' "$1" | sed 's/[]\[\\^$.*+?|(){}]/\\&/g')"
 }
 
 # Run darcs, feeding 'y' to any author-mismatch prompts and suppressing their text.
@@ -84,19 +121,65 @@ execute-todo() {
             done
         } > "$todo"
 
+        local escaped_name
+        escaped_name=$(escape-patch-name "$name")
+
+        # For patch actions: unsuspend the current patch (may flood in same-named
+        # duplicates), then re-suspend any that appear later in the todo.
+        # The original todo hashes are stale after a suspend/unsuspend round-trip
+        # (darcs reassigns hashes), so we look up current hashes from darcs log.
+        if [[ -n $hash ]]; then
+            darcs-yes rebase unsuspend --quiet --patches "$escaped_name"
+
+            local count_future=0 j
+            for (( j=idx+1; j<${#todo_lines[@]}; j++ )); do
+                local fline="${todo_lines[$j]}"
+                local faction="${fline%% *}"
+                [[ $faction == exec || $faction == break ]] && continue
+                local frest="${fline#* }"
+                local fname="${frest#* }"
+                [[ "$fname" == "$name" ]] && count_future=$(( count_future + 1 ))
+            done
+
+            if (( count_future > 0 )); then
+                # Gather the count_future most-recently-applied same-named patches
+                # from darcs log (newest-first) and re-suspend them.
+                local future_hashes=() curr_hash="" curr_name
+                while IFS= read -r xml_line; do
+                    if [[ $xml_line =~ \<patch[[:space:]] ]]; then
+                        curr_hash="${xml_line#*hash=\'}"
+                        curr_hash="${curr_hash%%\'*}"
+                    elif [[ $xml_line =~ \<name\> ]]; then
+                        curr_name="${xml_line#*<name>}"
+                        curr_name="${curr_name%%</name>*}"
+                        curr_name="${curr_name//&amp;/&}"
+                        curr_name="${curr_name//&lt;/<}"
+                        curr_name="${curr_name//&gt;/>}"
+                        curr_name="${curr_name//&quot;/\"}"
+                        if [[ "$curr_name" == "$name" ]]; then
+                            future_hashes+=("$curr_hash")
+                            if (( ${#future_hashes[@]} >= count_future )); then break; fi
+                        fi
+                    fi
+                done < <(darcs log --xml-output --patches "$escaped_name")
+
+                local k
+                for (( k=0; k<${#future_hashes[@]}; k++ )); do
+                    darcs-yes rebase suspend --all --quiet --hash "${future_hashes[$k]}"
+                done
+            fi
+        fi
+
         case $action in
             pick)
-                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 last_pick_name=$name
                 ;;
 
             drop)
-                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
-                darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --hash "$hash"
+                darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --patches "$escaped_name" --last=1
                 ;;
 
             reword)
-                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 darcs amend --all --edit-long-comment
                 last_pick_name=$name
                 ;;
@@ -106,7 +189,6 @@ execute-todo() {
                     printf '%s: squash has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
                     exit 1
                 }
-                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 darcs-yes unrecord --all --quiet --last=1
                 local squash_msg_file squash_editor_script
                 squash_msg_file=$(mktemp)
@@ -130,14 +212,11 @@ EOF
                     printf '%s: fixup has no previous pick to merge into\n' "$SCRIPT_NAME" >&2
                     exit 1
                 }
-                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
                 darcs-yes unrecord --all --quiet --last=1
                 darcs-yes amend --all
                 ;;
 
             edit)
-                darcs-yes rebase unsuspend --all --quiet --hash "$hash"
-
                 local remaining=()
                 local j
                 for (( j=idx+1; j<${#todo_lines[@]}; j++ )); do
@@ -189,22 +268,54 @@ EOF
     done
 
     # Obliterate patches implicitly dropped by deleting their line in the editor.
-    # Read original hashes from file; any not processed by the todo loop are still suspended.
+    # Read original hashes+names; any hash not processed by the todo loop is still suspended.
     local orig_hashes=()
-    while IFS=$'\t' read -r ohash _oname; do
+    local orig_names=()
+    while IFS=$'\t' read -r ohash oname; do
         orig_hashes+=("$ohash")
+        orig_names+=("$oname")
     done < "$rebase_dir/original-order"
 
-    local ohash
-    for ohash in "${orig_hashes[@]}"; do
+    # Group dropped patches by name so that when multiple same-named patches are
+    # dropped, we unsuspend them all at once (one call per unique name) and then
+    # obliterate them one at a time with --last=1.
+    local handled_cleanup_names=()
+    local i
+    for (( i=0; i<${#orig_hashes[@]}; i++ )); do
         local found=false ph
         for ph in "${processed_hashes[@]}"; do
-            [[ "$ph" == "$ohash" ]] && { found=true; break; }
+            [[ "$ph" == "${orig_hashes[$i]}" ]] && { found=true; break; }
         done
-        if ! $found; then
-            darcs-yes rebase unsuspend --all --quiet --hash "$ohash"
-            darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --hash "$ohash"
-        fi
+        $found && continue
+
+        local oname="${orig_names[$i]}"
+
+        local already_handled=false hn
+        for hn in "${handled_cleanup_names[@]+"${handled_cleanup_names[@]}"}"; do
+            [[ "$hn" == "$oname" ]] && { already_handled=true; break; }
+        done
+        $already_handled && continue
+        handled_cleanup_names+=("$oname")
+
+        local escaped_oname
+        escaped_oname=$(escape-patch-name "$oname")
+
+        # Count how many dropped patches share this name.
+        local drop_count=0 j
+        for (( j=i; j<${#orig_hashes[@]}; j++ )); do
+            local jfound=false jph
+            for jph in "${processed_hashes[@]}"; do
+                [[ "$jph" == "${orig_hashes[$j]}" ]] && { jfound=true; break; }
+            done
+            $jfound && continue
+            [[ "${orig_names[$j]}" == "$oname" ]] && drop_count=$(( drop_count + 1 ))
+        done
+
+        darcs-yes rebase unsuspend --quiet --patches "$escaped_oname"
+        local k
+        for (( k=0; k<drop_count; k++ )); do
+            darcs-yes obliterate --all --quiet --dont-prompt-for-dependencies --patches "$escaped_oname" --last=1
+        done
     done
 
     rm -rf "$rebase_dir"
@@ -515,10 +626,12 @@ cmd_abort() (
         darcs-yes rebase suspend --all --quiet --hash "${needs_resuspend_hashes[$i]}"
     done
 
-    local ohash
-    for ohash in "${orig_hashes[@]}"; do
-        darcs-yes rebase unsuspend --all --quiet --hash "$ohash" >/dev/null 2>&1 || {
-            printf '%s: warning: could not unsuspend hash %s\n' "$SCRIPT_NAME" "$ohash" >&2
+    local i
+    for (( i=0; i<${#orig_names[@]}; i++ )); do
+        local escaped_oname
+        escaped_oname=$(escape-patch-name "${orig_names[$i]}")
+        darcs-yes rebase unsuspend --quiet --patches "$escaped_oname" --last=1 >/dev/null 2>&1 || {
+            printf '%s: warning: could not unsuspend %q\n' "$SCRIPT_NAME" "${orig_names[$i]}" >&2
         }
     done
 
